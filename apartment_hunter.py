@@ -325,8 +325,8 @@ def main():
 
 if __name__ == '__main__':
     try:
-        success = main()
-        exit(0 if success else 1)
+        main()
+        exit(0)  # Always exit 0 — "no new apartments" is normal, not an error
     except Exception as e:
         print(f"\n❌ Fatal error: {e}")
         import traceback
