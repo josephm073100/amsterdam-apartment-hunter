@@ -196,25 +196,45 @@ def is_within_target_area(neighborhood, price):
 
 def send_notification(apartment_data):
     """Send push notification via ntfy.sh"""
-    try:
-        title = f"🏠 New: {apartment_data['title']}"
-        
-        message = f"""
-Price: €{apartment_data['price']}/month
-Available: {apartment_data.get('date_range', 'Check listing')}
-Neighborhood: {apartment_data['neighborhood']}
-Distance: ~{apartment_data['estimated_distance']:.1f} km from Roeterseiland
-Student-friendly: {apartment_data['student_status']}
-Priority: {apartment_data['priority']}
+    from urllib.request import urlopen, Request as URequest
 
-Link: {apartment_data['url']}
-"""
-        
-        # Send via ntfy.sh
-        cmd = f'curl -d "{message}" https://ntfy.sh/{NOTIFICATION_URL}'
-        os.system(cmd)
-        
-        print(f"✅ Notification sent: {apartment_data['title']}")
+    try:
+        title = f"New apt: {apartment_data['title']}"
+
+        dist = apartment_data.get('estimated_distance')
+        dist_str = f"~{dist:.1f} km from Roeterseiland" if dist is not None else "distance unknown"
+
+        message = (
+            f"Price: EUR{apartment_data['price']}/month\n"
+            f"Available: {apartment_data.get('date_range', 'Check listing')}\n"
+            f"Neighborhood: {apartment_data['neighborhood']}\n"
+            f"Distance: {dist_str}\n"
+            f"Student-friendly: {apartment_data['student_status']}\n"
+            f"Priority: {apartment_data['priority']}"
+        )
+
+        listing_url = apartment_data.get('url', '')
+
+        headers = {
+            "Title": title,
+            "Priority": "high" if apartment_data.get('priority') == 'high' else "default",
+            "Tags": "house",
+        }
+        if listing_url:
+            headers["Click"] = listing_url  # tapping the notification opens the listing
+
+        req = URequest(
+            f"https://ntfy.sh/{NOTIFICATION_URL}",
+            data=message.encode(),
+            headers=headers,
+            method="POST",
+        )
+        with urlopen(req) as r:
+            if r.status == 200:
+                print(f"✅ Notification sent: {apartment_data['title']}")
+            else:
+                print(f"⚠️  Unexpected ntfy status {r.status}")
+
     except Exception as e:
         print(f"❌ Failed to send notification: {e}")
 
