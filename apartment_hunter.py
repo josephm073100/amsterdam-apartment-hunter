@@ -455,15 +455,15 @@ def send_batch_notification(apartments):
 
 
 def send_heartbeat(new_count, total_seen, sources_summary):
-    """Always-on status ping so you know the bot is running even when nothing new is found."""
+    """Status notification every run — confirms the bot is alive."""
     title = f"Bot ran — {new_count} new apt{'s' if new_count != 1 else ''} found"
     message = (
         f"Run at {datetime.now().strftime('%Y-%m-%d %H:%M')} UTC\n"
-        f"New listings: {new_count}\n"
-        f"Total seen: {total_seen}\n"
+        f"New listings this run: {new_count}\n"
+        f"Total seen so far: {total_seen}\n"
         f"Sources: {sources_summary}"
     )
-    _ntfy_send(title, message, priority="min")  # silent/lowest priority — just a status ping
+    _ntfy_send(title, message, priority="default")
 
 
 def _ntfy_send(title, message, priority="default"):
