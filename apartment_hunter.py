@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Amsterdam Apartment Hunter - Finds student-friendly apartments near Roeterseiland
-Checks Pararius, Kamernet, and HousingAnywhere, filters by budget, student status, and transit distance
+Sources: Pararius, Kamernet, HousingAnywhere, DUWO, SSH, ROOM.nl
 """
 
 import json
@@ -12,66 +12,70 @@ import re
 import gzip
 from datetime import datetime
 from urllib.request import urlopen, Request
-from urllib.parse import urlencode, quote
+from urllib.parse import urlencode
 
-# Configuration
+# ─── CONFIG ──────────────────────────────────────────────────────────────────
+
 BUDGET_MIN = 0
-BUDGET_MAX = 1750  # in euros
-ROETERSEILAND_LAT = 52.3645
-ROETERSEILAND_LNG = 4.9107
-MAX_DISTANCE_KM = 5  # approximation for 30 min transit/bike
-NOTIFICATION_URL = os.environ.get('NTFY_TOPIC', 'your-topic-here')  # Set via GitHub secret
+BUDGET_MAX = 1750
+MAX_DISTANCE_KM = 5
+NOTIFICATION_URL = os.environ.get('NTFY_TOPIC', 'amsterdam-apts-josephm')
 DB_FILE = 'seen_apartments.json'
 
-# Date range for study abroad
-MOVE_IN_START = "2026-08-15"  # ~2 weeks before classes
-MOVE_IN_END = "2026-08-31"    # Or earlier if you find something
-CLASSES_END = "2027-01-30"    # Last class date
-LATEST_CHECKOUT = "2027-02-05"  # A few days after to prepare return
+MOVE_IN_START  = "2026-08-15"
+CLASSES_END    = "2027-01-30"
+LATEST_CHECKOUT = "2027-02-05"
 
-# Neighborhoods close to Roeterseiland within transit distance
 TARGET_NEIGHBORHOODS = [
     'Indische Buurt', 'Zeeburg', 'Watergraafsmeer', 'Oosterparkbuurt',
     'Amsterdam-Oost', 'Plantage', 'Oud-Oost', 'Oost',
-    'Roeterseiland', 'Weesperbuurt', 'Creatiecijn', 'Dapperbuurt',
+    'Roeterseiland', 'Weesperbuurt', 'Dapperbuurt',
     'Oostelijk Havengebied', 'IJburg', 'Diemen',
+    'Jordaan', 'De Pijp', 'Grachtengordel', 'Centrum',
+    'Amsterdam',  # generic fallback
 ]
 
 BROWSER_HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
     'Accept-Language': 'en-US,en;q=0.9,nl;q=0.8',
     'Accept-Encoding': 'gzip, deflate',
     'Connection': 'keep-alive',
-    'Upgrade-Insecure-Requests': '1',
-    'Cache-Control': 'no-cache',
 }
 
+# ─── HELPERS ─────────────────────────────────────────────────────────────────
 
 def fetch_html(url, extra_headers=None):
-    """Fetch a URL and return decoded HTML string."""
     headers = dict(BROWSER_HEADERS)
     if extra_headers:
         headers.update(extra_headers)
     req = Request(url, headers=headers)
     with urlopen(req, timeout=30) as r:
         raw = r.read()
-    # Handle gzip encoding
     try:
         return gzip.decompress(raw).decode('utf-8', errors='ignore')
     except Exception:
         return raw.decode('utf-8', errors='ignore')
 
+def fetch_json(url, extra_headers=None):
+    headers = dict(BROWSER_HEADERS)
+    headers['Accept'] = 'application/json'
+    if extra_headers:
+        headers.update(extra_headers)
+    req = Request(url, headers=headers)
+    with urlopen(req, timeout=20) as r:
+        raw = r.read()
+    try:
+        return json.loads(gzip.decompress(raw))
+    except Exception:
+        return json.loads(raw)
 
 def parse_price(text):
-    """Extract integer price from strings like '€ 1,250 /mnd' or 'EUR1250'."""
-    text = text.replace(',', '').replace('.', '')
+    text = str(text).replace(',', '').replace('.', '').replace(' ', '')
     nums = re.findall(r'\d{3,}', text)
     return int(nums[0]) if nums else 0
 
-
 def load_seen_apartments():
-    """Load previously seen apartment IDs from local file"""
     if os.path.exists(DB_FILE):
         try:
             with open(DB_FILE, 'r') as f:
@@ -80,45 +84,36 @@ def load_seen_apartments():
             return {}
     return {}
 
-
 def save_seen_apartments(data):
-    """Save seen apartment IDs to local file"""
     with open(DB_FILE, 'w') as f:
         json.dump(data, f)
-
 
 # ─── SCRAPERS ────────────────────────────────────────────────────────────────
 
 def scrape_pararius():
-    """Scrape Pararius.com for Amsterdam apartments under €1750."""
-    from bs4 import BeautifulSoup
+    """Scrape Pararius with BeautifulSoup. May be blocked by Cloudflare on cloud IPs."""
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError:
+        print("[Pararius] BeautifulSoup not installed, skipping")
+        return []
+
     apartments = []
     base = "https://www.pararius.com"
 
-    # Pararius paginates with /page-N; scrape first 3 pages
     for page in range(1, 4):
         try:
             url = f"{base}/apartments/amsterdam/0-1750" + (f"/page-{page}" if page > 1 else "")
-            print(f"[Pararius] Fetching page {page}...")
             html = fetch_html(url)
             soup = BeautifulSoup(html, 'html.parser')
 
-            listings = soup.select(
-                'li.search-list__item--listing, '
-                'section.listing-search-item'
-            )
-
+            listings = soup.select('li.search-list__item--listing, section.listing-search-item')
             if not listings:
-                # Try alternate selectors
-                listings = soup.find_all(attrs={'data-listing-id': True})
-
-            if not listings:
-                print(f"[Pararius] No listings found on page {page} (may be blocked or end of results)")
+                print(f"[Pararius] No listings on page {page} (likely blocked by Cloudflare)")
                 break
 
             for item in listings:
                 try:
-                    # URL + title
                     link = (
                         item.find('a', class_=re.compile(r'listing-search-item__link')) or
                         item.find('a', href=re.compile(r'/apartment/'))
@@ -130,65 +125,46 @@ def scrape_pararius():
                         href = f"{base}{href}"
                     title = link.get_text(strip=True) or href
 
-                    # Price
                     price_el = item.find(class_=re.compile(r'price'))
                     price = parse_price(price_el.get_text() if price_el else '')
 
-                    # Location
                     loc_el = item.find(class_=re.compile(r'sub-title|location|city'))
                     location = loc_el.get_text(strip=True) if loc_el else ''
                     neighborhood = location.split(',')[0].strip() if location else 'Amsterdam'
 
-                    # Description snippets
-                    desc_el = item.find(class_=re.compile(r'description|features|tag'))
+                    desc_el = item.find(class_=re.compile(r'description|features'))
                     description = desc_el.get_text(' ', strip=True) if desc_el else ''
 
                     if title and 0 < price <= BUDGET_MAX:
                         apartments.append({
-                            'title': title,
-                            'price': price,
+                            'title': title, 'price': price,
                             'neighborhood': neighborhood,
-                            'url': href,
-                            'description': description,
+                            'url': href, 'description': description,
                         })
                 except Exception:
                     continue
 
-            time.sleep(2)  # be polite between pages
-
+            time.sleep(2)
         except Exception as e:
-            print(f"[Pararius] Error on page {page}: {e}")
+            print(f"[Pararius] Error page {page}: {e}")
             break
 
-    print(f"[Pararius] Total: {len(apartments)} listings")
+    print(f"[Pararius] Found {len(apartments)} listings")
     return apartments
 
 
 def scrape_kamernet():
-    """Scrape Kamernet via their JSON search API."""
+    """Kamernet JSON search API."""
     apartments = []
     try:
-        api_url = (
+        # Try their public search API
+        url = (
             "https://kamernet.nl/api/v1/search/listings"
-            "?locationids=1&radius=10&maxrent=1750&listingtype=7"  # listingtype 7 = apartments
-            "&pageno=1&pagesize=40&sortby=date_desc"
+            "?locationids=1&radius=10&maxrent=1750&listingtype=7&pageno=1&pagesize=40&sortby=date_desc"
         )
-        headers = dict(BROWSER_HEADERS)
-        headers.update({
-            'Accept': 'application/json',
-            'X-Requested-With': 'XMLHttpRequest',
-            'Referer': 'https://kamernet.nl/en/for-rent/apartments-amsterdam',
-        })
-        req = Request(api_url, headers=headers)
-        with urlopen(req, timeout=20) as r:
-            raw = r.read()
-        try:
-            data = json.loads(gzip.decompress(raw))
-        except Exception:
-            data = json.loads(raw)
-
+        data = fetch_json(url, {'Referer': 'https://kamernet.nl/en/for-rent/apartments-amsterdam'})
         listings = data.get('listings') or data.get('data') or []
-        print(f"[Kamernet] API returned {len(listings)} listings")
+        print(f"[Kamernet] API returned {len(listings)} raw listings")
 
         for item in listings:
             try:
@@ -196,87 +172,165 @@ def scrape_kamernet():
                 if not price or price > BUDGET_MAX:
                     continue
                 title = item.get('title') or item.get('listingTitle') or 'Kamernet listing'
-                city_district = item.get('cityDistrictName') or item.get('neighborhood') or ''
-                neighborhood = city_district.split(',')[0].strip() if city_district else 'Amsterdam'
-                listing_id = item.get('listingId') or item.get('id') or ''
-                url = f"https://kamernet.nl/en/for-rent/room-amsterdam/{listing_id}" if listing_id else 'https://kamernet.nl'
-                description = item.get('description') or item.get('descriptionTranslated') or ''
-                available_from = item.get('availableFrom') or ''
-                available_until = item.get('availableUntil') or ''
-
+                district = item.get('cityDistrictName') or item.get('neighborhood') or 'Amsterdam'
+                neighborhood = district.split(',')[0].strip()
+                lid = item.get('listingId') or item.get('id') or ''
+                url_val = f"https://kamernet.nl/en/for-rent/room-amsterdam/{lid}" if lid else 'https://kamernet.nl'
                 apt = {
-                    'title': title,
-                    'price': price,
+                    'title': title, 'price': price,
                     'neighborhood': neighborhood,
-                    'url': url,
-                    'description': description,
+                    'url': url_val,
+                    'description': item.get('description') or '',
                 }
-                if available_from:
-                    apt['available_from'] = available_from[:10]  # YYYY-MM-DD
-                if available_until:
-                    apt['available_until'] = available_until[:10]
+                if item.get('availableFrom'):
+                    apt['available_from'] = str(item['availableFrom'])[:10]
+                if item.get('availableUntil'):
+                    apt['available_until'] = str(item['availableUntil'])[:10]
                 apartments.append(apt)
+            except Exception:
+                continue
+    except Exception as e:
+        print(f"[Kamernet] Error: {e}")
+
+    print(f"[Kamernet] Found {len(apartments)} listings")
+    return apartments
+
+
+def scrape_duwo():
+    """DUWO — major Amsterdam student housing provider. Less aggressive blocking."""
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError:
+        return []
+
+    apartments = []
+    try:
+        url = "https://www.duwo.nl/en/housing/find-a-room/"
+        html = fetch_html(url)
+        soup = BeautifulSoup(html, 'html.parser')
+
+        # DUWO typically lists rooms in a table or card layout
+        cards = soup.select('.housing-offer, .room-offer, .listing, article, [class*="offer"], [class*="room"]')
+        print(f"[DUWO] Found {len(cards)} raw cards")
+
+        for card in cards:
+            try:
+                link = card.find('a', href=True)
+                href = link['href'] if link else ''
+                if href and not href.startswith('http'):
+                    href = 'https://www.duwo.nl' + href
+
+                title_el = card.find(['h2', 'h3', 'h4', 'h5'])
+                title = title_el.get_text(strip=True) if title_el else ''
+
+                price_el = card.find(string=re.compile(r'[€]\s*\d+|\d+\s*[€]|EUR\s*\d+'))
+                price = parse_price(price_el) if price_el else 0
+
+                loc_el = card.find(string=re.compile(r'Amsterdam|Oost|Centrum|Noord|Zuid|West'))
+                neighborhood = loc_el.strip() if loc_el else 'Amsterdam'
+
+                if title and price > 0:
+                    apartments.append({
+                        'title': f"[DUWO] {title}", 'price': price,
+                        'neighborhood': neighborhood,
+                        'url': href or 'https://www.duwo.nl',
+                        'description': card.get_text(' ', strip=True)[:300],
+                    })
             except Exception:
                 continue
 
     except Exception as e:
-        print(f"[Kamernet] Error: {e}")
+        print(f"[DUWO] Error: {e}")
 
-    print(f"[Kamernet] Total: {len(apartments)} listings")
+    print(f"[DUWO] Found {len(apartments)} listings")
+    return apartments
+
+
+def scrape_room_nl():
+    """ROOM.nl — national student housing platform with Amsterdam listings."""
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError:
+        return []
+
+    apartments = []
+    try:
+        # ROOM.nl has an offer search page
+        url = "https://www.room.nl/en/offerings/to-rent/detail/?city=Amsterdam&priceMax=1750"
+        html = fetch_html(url)
+        soup = BeautifulSoup(html, 'html.parser')
+
+        cards = soup.select('.offer, .listing-item, [class*="offer"], [class*="listing"]')
+        print(f"[ROOM.nl] Found {len(cards)} raw cards")
+
+        for card in cards:
+            try:
+                link = card.find('a', href=True)
+                href = link['href'] if link else ''
+                if href and not href.startswith('http'):
+                    href = 'https://www.room.nl' + href
+
+                title_el = card.find(['h2', 'h3', 'h4'])
+                title = title_el.get_text(strip=True) if title_el else ''
+
+                price_el = card.find(string=re.compile(r'€\s*\d+|\d+\s*/\s*month'))
+                price = parse_price(price_el) if price_el else 0
+
+                if title and price > 0:
+                    apartments.append({
+                        'title': f"[ROOM] {title}", 'price': price,
+                        'neighborhood': 'Amsterdam',
+                        'url': href or 'https://www.room.nl',
+                        'description': card.get_text(' ', strip=True)[:300],
+                    })
+            except Exception:
+                continue
+
+    except Exception as e:
+        print(f"[ROOM.nl] Error: {e}")
+
+    print(f"[ROOM.nl] Found {len(apartments)} listings")
     return apartments
 
 
 def scrape_housinganywhere():
-    """Scrape HousingAnywhere — student-focused, often has English listings."""
-    from bs4 import BeautifulSoup
-    apartments = []
-    base = "https://housinganywhere.com"
+    """HousingAnywhere — student-focused international platform."""
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError:
+        return []
 
+    apartments = []
     try:
         url = (
-            f"{base}/s/Amsterdam--Netherlands"
-            "?minPrice=0&maxPrice=1750&roomType=apartment,studio,private-room"
-            "&sort=newest"
+            "https://housinganywhere.com/s/Amsterdam--Netherlands"
+            "?minPrice=0&maxPrice=1750&roomType=apartment,studio,private-room&sort=newest"
         )
-        print("[HousingAnywhere] Fetching listings...")
         html = fetch_html(url)
         soup = BeautifulSoup(html, 'html.parser')
 
-        # HousingAnywhere embeds listing data in JSON script tags
-        scripts = soup.find_all('script', type='application/ld+json')
-        for script in scripts:
+        # Try JSON-LD structured data first
+        for script in soup.find_all('script', type='application/ld+json'):
             try:
                 data = json.loads(script.string or '{}')
-                items = []
-                if isinstance(data, list):
-                    items = data
-                elif data.get('@type') == 'ItemList':
-                    items = data.get('itemListElement', [])
-
+                items = data if isinstance(data, list) else data.get('itemListElement', [])
                 for item in items:
-                    try:
-                        offer = item.get('item', item)
-                        name = offer.get('name', '')
-                        url_val = offer.get('url', '')
-                        offers = offer.get('offers', {})
-                        price = int(float(str(offers.get('price', 0)).replace(',', '')))
-                        address = offer.get('address', {})
-                        neighborhood = address.get('addressLocality', 'Amsterdam')
-
-                        if name and 0 < price <= BUDGET_MAX:
-                            apartments.append({
-                                'title': name,
-                                'price': price,
-                                'neighborhood': neighborhood,
-                                'url': url_val or url,
-                                'description': offer.get('description', ''),
-                            })
-                    except Exception:
-                        continue
+                    offer = item.get('item', item)
+                    name = offer.get('name', '')
+                    url_val = offer.get('url', '')
+                    offers = offer.get('offers', {})
+                    price = int(float(str(offers.get('price', 0)).replace(',', '')))
+                    if name and 0 < price <= BUDGET_MAX:
+                        apartments.append({
+                            'title': name, 'price': price,
+                            'neighborhood': offer.get('address', {}).get('addressLocality', 'Amsterdam'),
+                            'url': url_val or url,
+                            'description': offer.get('description', ''),
+                        })
             except Exception:
                 continue
 
-        # Also try card-based HTML parsing as fallback
+        # HTML card fallback
         if not apartments:
             cards = soup.select('[data-testid*="listing"], [class*="ListingCard"], [class*="listing-card"]')
             for card in cards:
@@ -284,18 +338,16 @@ def scrape_housinganywhere():
                     link = card.find('a', href=True)
                     href = link['href'] if link else ''
                     if href and not href.startswith('http'):
-                        href = base + href
+                        href = 'https://housinganywhere.com' + href
                     title_el = card.find(['h2', 'h3', 'h4'])
                     title = title_el.get_text(strip=True) if title_el else ''
-                    price_el = card.find(string=re.compile(r'€\s*\d+'))
-                    price = parse_price(price_el) if price_el else 0
+                    price_match = re.search(r'€\s*(\d[\d,.]*)', card.get_text())
+                    price = parse_price(price_match.group(1)) if price_match else 0
                     if title and 0 < price <= BUDGET_MAX:
                         apartments.append({
-                            'title': title,
-                            'price': price,
+                            'title': title, 'price': price,
                             'neighborhood': 'Amsterdam',
-                            'url': href,
-                            'description': '',
+                            'url': href, 'description': '',
                         })
                 except Exception:
                     continue
@@ -303,120 +355,69 @@ def scrape_housinganywhere():
     except Exception as e:
         print(f"[HousingAnywhere] Error: {e}")
 
-    print(f"[HousingAnywhere] Total: {len(apartments)} listings")
+    print(f"[HousingAnywhere] Found {len(apartments)} listings")
     return apartments
 
 
 # ─── FILTERING & SCORING ─────────────────────────────────────────────────────
 
-def check_student_friendly(description, listing_title):
-    """Determine if apartment is student-friendly"""
-    if not description:
-        description = ""
-    text = (description + " " + listing_title).lower()
-    if any(phrase in text for phrase in [
-        'students allowed', 'student housing', 'student-friendly',
-        'suitable for students', 'allows students', 'no age limit',
-        'international students', 'expats welcome',
-    ]):
+def check_student_friendly(description, title):
+    text = (description + " " + title).lower()
+    if any(p in text for p in ['students allowed', 'student housing', 'student-friendly',
+                                'suitable for students', 'allows students', 'international students',
+                                'expats welcome', 'no age limit']):
         return {'is_student': True, 'priority': 'high'}
     if 'no students' not in text and 'not suitable for students' not in text:
         return {'is_student': None, 'priority': 'medium'}
     return {'is_student': False, 'priority': 'low'}
 
 
-def check_amenities(description, listing_title):
-    """
-    Check for private bathroom and kitchen.
-    Private bath/shower: preferred, boosts priority.
-    Private kitchen: nice to have, further boosts priority.
-    """
-    if not description:
-        description = ""
-    text = (description + " " + listing_title).lower()
-
-    private_bath = any(phrase in text for phrase in [
+def check_amenities(description, title):
+    text = (description + " " + title).lower()
+    private_bath = any(p in text for p in [
         'private bathroom', 'private bath', 'private shower', 'en suite', 'ensuite',
-        'own bathroom', 'own bath', 'own shower', 'private toilet', 'private facilities',
-        'eigen badkamer', 'eigen douche', 'eigen toilet',
+        'own bathroom', 'own shower', 'eigen badkamer', 'eigen douche', 'eigen toilet',
     ])
-    shared_bath = any(phrase in text for phrase in [
-        'shared bathroom', 'shared bath', 'shared shower', 'shared facilities',
-        'communal bathroom', 'gedeelde badkamer',
+    shared_bath = any(p in text for p in [
+        'shared bathroom', 'shared bath', 'shared shower', 'communal bathroom', 'gedeelde badkamer',
     ])
-    private_kitchen = any(phrase in text for phrase in [
+    private_kitchen = any(p in text for p in [
         'private kitchen', 'own kitchen', 'kitchenette', 'studio',
         'eigen keuken', 'eigen kookgelegenheid',
     ])
-    shared_kitchen = any(phrase in text for phrase in [
+    shared_kitchen = any(p in text for p in [
         'shared kitchen', 'communal kitchen', 'gedeelde keuken',
     ])
-
-    bath_status = 'private' if private_bath else ('shared' if shared_bath else 'unknown')
-    kitchen_status = 'private' if private_kitchen else ('shared' if shared_kitchen else 'unknown')
-
-    priority_boost = 0
-    if private_bath:
-        priority_boost += 2
-    elif shared_bath:
-        priority_boost -= 1
-    if private_kitchen:
-        priority_boost += 1
-
-    return {
-        'bathroom': bath_status,
-        'kitchen': kitchen_status,
-        'priority_boost': priority_boost,
-    }
+    bath = 'private' if private_bath else ('shared' if shared_bath else 'unknown')
+    kitchen = 'private' if private_kitchen else ('shared' if shared_kitchen else 'unknown')
+    boost = (2 if private_bath else (-1 if shared_bath else 0)) + (1 if private_kitchen else 0)
+    return {'bathroom': bath, 'kitchen': kitchen, 'priority_boost': boost}
 
 
 def check_date_availability(available_from, available_until):
-    """Validate that apartment covers Aug 15, 2026 - Feb 5, 2027"""
     try:
-        if isinstance(available_from, str):
-            from_date = datetime.strptime(available_from[:10], '%Y-%m-%d').date()
-        else:
-            from_date = available_from
-        if isinstance(available_until, str):
-            until_date = datetime.strptime(available_until[:10], '%Y-%m-%d').date()
-        else:
-            until_date = available_until
-
-        move_in_start = datetime.strptime(MOVE_IN_START, '%Y-%m-%d').date()
-        classes_end = datetime.strptime(CLASSES_END, '%Y-%m-%d').date()
-
-        if from_date > move_in_start:
-            return False, f"Available {from_date.strftime('%b %d')} - too late for move-in"
-        if until_date < classes_end:
+        from_date = datetime.strptime(str(available_from)[:10], '%Y-%m-%d').date()
+        until_date = datetime.strptime(str(available_until)[:10], '%Y-%m-%d').date()
+        move_in = datetime.strptime(MOVE_IN_START, '%Y-%m-%d').date()
+        end = datetime.strptime(CLASSES_END, '%Y-%m-%d').date()
+        if from_date > move_in:
+            return False, f"Available {from_date.strftime('%b %d')} - too late"
+        if until_date < end:
             return False, f"Ends {until_date.strftime('%b %d')} - before classes end"
-
         return True, f"{from_date.strftime('%b %d')} - {until_date.strftime('%b %d')}"
     except Exception as e:
-        print(f"Warning: Could not parse dates - {e}")
-        return True, "Dates not specified"  # allow through if we can't parse
+        return True, "Dates not specified"  # let through if unparseable
 
 
-def calculate_distance_estimate(neighborhood):
-    """Estimate distance from Roeterseiland based on neighborhood"""
+def calculate_distance(neighborhood):
     distances = {
-        'Roeterseiland': 0.0,
-        'Plantage': 0.5,
-        'Weesperbuurt': 0.8,
-        'Indische Buurt': 1.2,
-        'Oosterparkbuurt': 1.5,
-        'Oost': 2.0,
-        'Oud-Oost': 2.2,
-        'Amsterdam-Oost': 2.0,
-        'Dapperbuurt': 1.8,
-        'Zeeburg': 2.5,
-        'Watergraafsmeer': 3.0,
-        'Oostelijk Havengebied': 3.2,
-        'IJburg': 5.0,
-        'Diemen': 4.5,
-        'Jordaan': 3.5,
-        'De Pijp': 3.0,
-        'Oud-Zuid': 4.0,
-        'Amsterdam': 2.5,  # generic fallback
+        'Roeterseiland': 0.0, 'Plantage': 0.5, 'Weesperbuurt': 0.8,
+        'Indische Buurt': 1.2, 'Dapperbuurt': 1.8, 'Oosterparkbuurt': 1.5,
+        'Oost': 2.0, 'Oud-Oost': 2.2, 'Amsterdam-Oost': 2.0,
+        'Zeeburg': 2.5, 'Watergraafsmeer': 3.0, 'Jordaan': 3.5,
+        'De Pijp': 3.0, 'Centrum': 2.0, 'Grachtengordel': 2.5,
+        'Oostelijk Havengebied': 3.2, 'IJburg': 5.0, 'Diemen': 4.5,
+        'Amsterdam': 2.5,
     }
     for key, val in distances.items():
         if key.lower() in neighborhood.lower():
@@ -425,68 +426,68 @@ def calculate_distance_estimate(neighborhood):
 
 
 def is_within_target_area(neighborhood):
-    """Check if apartment is in a target neighborhood and within distance."""
-    distance = calculate_distance_estimate(neighborhood)
-    if distance is None:
-        return False
-    return distance <= MAX_DISTANCE_KM
+    dist = calculate_distance(neighborhood)
+    return dist is not None and dist <= MAX_DISTANCE_KM
 
 
-# ─── NOTIFICATION ─────────────────────────────────────────────────────────────
+# ─── NOTIFICATIONS ────────────────────────────────────────────────────────────
 
 def send_batch_notification(apartments):
     """Send one summary notification for all new apartments found this run."""
     if not apartments:
         return
-
     count = len(apartments)
     title = f"{count} new Amsterdam apt{'s' if count > 1 else ''} found"
-
     lines = [f"{count} new listing{'s' if count > 1 else ''} this run:\n"]
     for i, apt in enumerate(apartments, 1):
         dist = apt.get('estimated_distance')
         dist_str = f"~{dist:.1f} km" if dist is not None else "dist unknown"
-        bath = apt.get('bathroom', 'unknown')
-        kitchen = apt.get('kitchen', 'unknown')
-        url = apt.get('url', '')
-
         lines.append(f"{i}. {apt['title']} - {apt['neighborhood']}")
         lines.append(f"   EUR{apt['price']}/month | {apt.get('date_range', 'Check listing')}")
-        lines.append(f"   {dist_str} | Bathroom: {bath} | Kitchen: {kitchen}")
-        lines.append(f"   Student-friendly: {apt['student_status']} | Priority: {apt['priority']}")
-        if url:
-            lines.append(f"   {url}")
+        lines.append(f"   {dist_str} | Bath: {apt.get('bathroom','?')} | Kitchen: {apt.get('kitchen','?')}")
+        lines.append(f"   Student: {apt['student_status']} | Priority: {apt['priority']}")
+        if apt.get('url'):
+            lines.append(f"   {apt['url']}")
         lines.append("")
-
     message = "\n".join(lines).strip()
     has_high = any(a.get('priority') == 'high' for a in apartments)
+    _ntfy_send(title, message, priority="high" if has_high else "default")
 
+
+def send_heartbeat(new_count, total_seen, sources_summary):
+    """Always-on status ping so you know the bot is running even when nothing new is found."""
+    title = f"Bot ran — {new_count} new apt{'s' if new_count != 1 else ''} found"
+    message = (
+        f"Run at {datetime.now().strftime('%Y-%m-%d %H:%M')} UTC\n"
+        f"New listings: {new_count}\n"
+        f"Total seen: {total_seen}\n"
+        f"Sources: {sources_summary}"
+    )
+    _ntfy_send(title, message, priority="min")  # silent/lowest priority — just a status ping
+
+
+def _ntfy_send(title, message, priority="default"):
     try:
         req = Request(
             f"https://ntfy.sh/{NOTIFICATION_URL}",
             data=message.encode(),
-            headers={
-                "Title": title,
-                "Priority": "high" if has_high else "default",
-                "Tags": "house",
-            },
+            headers={"Title": title, "Priority": priority, "Tags": "house"},
             method="POST",
         )
-        with urlopen(req) as r:
+        with urlopen(req, timeout=15) as r:
             if r.status == 200:
-                print(f"✅ Batch notification sent: {count} apartment(s)")
+                print(f"✅ Notification sent: {title}")
             else:
-                print(f"⚠️  Unexpected ntfy status {r.status}")
+                print(f"⚠️  ntfy status {r.status}")
     except Exception as e:
-        print(f"❌ Failed to send notification: {e}")
+        print(f"❌ Notification failed: {e}")
 
 
 # ─── PROCESSING ──────────────────────────────────────────────────────────────
 
 def process_apartment(item, source):
-    """Validate and score a single apartment listing."""
     try:
-        apartment = {
+        apt = {
             'id': hashlib.md5(f"{item.get('url','')}{item.get('title','')}".encode()).hexdigest(),
             'title': item['title'],
             'price': item['price'],
@@ -494,99 +495,93 @@ def process_apartment(item, source):
             'url': item.get('url', ''),
             'source': source,
             'found_at': datetime.now().isoformat(),
-            'estimated_distance': calculate_distance_estimate(item['neighborhood']),
+            'estimated_distance': calculate_distance(item['neighborhood']),
         }
-
-        # Price filter
-        if apartment['price'] < BUDGET_MIN or apartment['price'] > BUDGET_MAX:
+        if apt['price'] < BUDGET_MIN or apt['price'] > BUDGET_MAX:
+            return None
+        if not is_within_target_area(apt['neighborhood']):
             return None
 
-        # Distance filter
-        if not is_within_target_area(apartment['neighborhood']):
-            return None
+        student = check_student_friendly(item.get('description', ''), item['title'])
+        apt['student_status'] = student['is_student']
+        apt['priority'] = student['priority']
 
-        # Student status
-        student_info = check_student_friendly(item.get('description', ''), item['title'])
-        apartment['student_status'] = student_info['is_student']
-        apartment['priority'] = student_info['priority']
+        amenity = check_amenities(item.get('description', ''), item['title'])
+        apt['bathroom'] = amenity['bathroom']
+        apt['kitchen'] = amenity['kitchen']
 
-        # Amenities
-        amenity_info = check_amenities(item.get('description', ''), item['title'])
-        apartment['bathroom'] = amenity_info['bathroom']
-        apartment['kitchen'] = amenity_info['kitchen']
+        boost = amenity['priority_boost']
+        order = ['low', 'medium', 'high']
+        idx = order.index(apt['priority'])
+        apt['priority'] = order[max(0, min(2, idx + (1 if boost > 0 else (-1 if boost < 0 else 0))))]
 
-        # Adjust priority based on amenities
-        boost = amenity_info['priority_boost']
-        priority_order = ['low', 'medium', 'high']
-        current_idx = priority_order.index(apartment['priority'])
-        new_idx = max(0, min(2, current_idx + (1 if boost > 0 else (-1 if boost < 0 else 0))))
-        apartment['priority'] = priority_order[new_idx]
-
-        # Date filter (only if dates provided)
         if 'available_from' in item and 'available_until' in item:
-            date_valid, date_range = check_date_availability(item['available_from'], item['available_until'])
-            apartment['date_range'] = date_range
-            if not date_valid:
+            valid, date_range = check_date_availability(item['available_from'], item['available_until'])
+            apt['date_range'] = date_range
+            if not valid:
                 return None
         else:
-            apartment['date_range'] = "Dates not specified"
+            apt['date_range'] = "Dates not specified"
 
-        return apartment
-
+        return apt
     except Exception as e:
-        print(f"Error processing apartment: {e}")
+        print(f"Error processing: {e}")
         return None
 
 
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
 
 def main():
-    print(f"\n🔍 Amsterdam Apartment Hunter - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"Budget: €{BUDGET_MIN}-{BUDGET_MAX} | Max distance: {MAX_DISTANCE_KM}km from Roeterseiland")
+    print(f"\n🔍 Amsterdam Apartment Hunter — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} UTC")
+    print(f"Budget: €{BUDGET_MIN}–{BUDGET_MAX} | Max: {MAX_DISTANCE_KM}km from Roeterseiland")
+    print(f"ntfy topic: {NOTIFICATION_URL}")
     print("-" * 60)
 
     seen = load_seen_apartments()
     new_apartments = []
 
-    print("\n📡 Scraping apartment listings...")
+    print("\n📡 Scraping...")
+    sources = [
+        (scrape_pararius,       'Pararius'),
+        (scrape_kamernet,       'Kamernet'),
+        (scrape_housinganywhere,'HousingAnywhere'),
+        (scrape_duwo,           'DUWO'),
+        (scrape_room_nl,        'ROOM.nl'),
+    ]
 
-    all_apartments = []
+    all_raw = []
+    source_counts = {}
+    for fn, name in sources:
+        try:
+            results = fn()
+            source_counts[name] = len(results)
+            all_raw.extend([(r, name) for r in results])
+        except Exception as e:
+            print(f"[{name}] Uncaught error: {e}")
+            source_counts[name] = 0
+        time.sleep(1)
 
-    pararius_apts = scrape_pararius()
-    all_apartments.extend([(apt, 'Pararius') for apt in pararius_apts])
-    time.sleep(2)
+    print(f"\n✅ Raw total: {len(all_raw)}")
 
-    kamernet_apts = scrape_kamernet()
-    all_apartments.extend([(apt, 'Kamernet') for apt in kamernet_apts])
-    time.sleep(2)
-
-    ha_apts = scrape_housinganywhere()
-    all_apartments.extend([(apt, 'HousingAnywhere') for apt in ha_apts])
-
-    print(f"\n✅ Raw listings fetched: {len(all_apartments)}")
-
-    for apartment_data, source in all_apartments:
-        apartment = process_apartment(apartment_data, source)
-        if not apartment:
+    for item, source in all_raw:
+        apt = process_apartment(item, source)
+        if not apt or apt['id'] in seen:
             continue
-        if apartment['id'] in seen:
-            continue
-        seen[apartment['id']] = apartment
-        new_apartments.append(apartment)
+        seen[apt['id']] = apt
+        new_apartments.append(apt)
 
     save_seen_apartments(seen)
 
     if new_apartments:
         send_batch_notification(new_apartments)
 
-    print(f"\n📊 Summary:")
-    print(f"  New apartments found: {len(new_apartments)}")
-    print(f"  Total seen so far:    {len(seen)}")
+    sources_str = " | ".join(f"{k}:{v}" for k, v in source_counts.items())
+    send_heartbeat(len(new_apartments), len(seen), sources_str)
 
+    print(f"\n📊 New: {len(new_apartments)} | Total seen: {len(seen)}")
     if new_apartments:
-        print(f"\n🎯 New apartments:")
         for apt in new_apartments:
-            print(f"  - [{apt['source']}] {apt['title']}: €{apt['price']} ({apt['priority']} priority)")
+            print(f"  [{apt['source']}] {apt['title']}: €{apt['price']} ({apt['priority']})")
 
     return len(new_apartments) > 0
 
@@ -596,7 +591,7 @@ if __name__ == '__main__':
         main()
         exit(0)
     except Exception as e:
-        print(f"\n❌ Fatal error: {e}")
+        print(f"\n❌ Fatal: {e}")
         import traceback
         traceback.print_exc()
         exit(1)
