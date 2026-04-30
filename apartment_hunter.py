@@ -103,19 +103,86 @@ def check_student_friendly(description, listing_title):
     """Determine if apartment is student-friendly"""
     if not description:
         description = ""
-    
+
     text = (description + " " + listing_title).lower()
-    
+
     # High priority: explicitly allows students
-    if any(phrase in text for phrase in ['students allowed', 'student housing', 'student-friendly', 
+    if any(phrase in text for phrase in ['students allowed', 'student housing', 'student-friendly',
                                            'suitable for students', 'allows students', 'no age limit']):
         return {'is_student': True, 'priority': 'high'}
-    
+
     # Medium priority: no mention of restrictions
     if 'no students' not in text and 'not suitable for students' not in text:
         return {'is_student': None, 'priority': 'medium'}
-    
+
     return {'is_student': False, 'priority': 'low'}
+
+def check_amenities(description, listing_title):
+    """
+    Check for private bathroom and kitchen.
+    Private bath/shower: required minimum, boosts priority.
+    Private kitchen: nice to have, further boosts priority.
+    Returns dict with bathroom, kitchen status and a priority bonus.
+    """
+    if not description:
+        description = ""
+
+    text = (description + " " + listing_title).lower()
+
+    # Private bathroom detection
+    private_bath = any(phrase in text for phrase in [
+        'private bathroom', 'private bath', 'private shower', 'en suite', 'ensuite',
+        'own bathroom', 'own bath', 'own shower', 'private toilet', 'private facilities',
+        'eigen badkamer', 'eigen douche', 'eigen toilet',  # Dutch
+    ])
+    shared_bath = any(phrase in text for phrase in [
+        'shared bathroom', 'shared bath', 'shared shower', 'shared facilities',
+        'communal bathroom', 'gedeelde badkamer',  # Dutch
+    ])
+
+    # Private kitchen detection
+    private_kitchen = any(phrase in text for phrase in [
+        'private kitchen', 'own kitchen', 'kitchenette', 'studio',
+        'eigen keuken', 'eigen kookgelegenheid',  # Dutch
+    ])
+    shared_kitchen = any(phrase in text for phrase in [
+        'shared kitchen', 'communal kitchen', 'gedeelde keuken',  # Dutch
+    ])
+
+    # Determine bathroom status
+    if private_bath:
+        bath_status = 'private'
+    elif shared_bath:
+        bath_status = 'shared'
+    else:
+        bath_status = 'unknown'
+
+    # Determine kitchen status
+    if private_kitchen:
+        kitchen_status = 'private'
+    elif shared_kitchen:
+        kitchen_status = 'shared'
+    else:
+        kitchen_status = 'unknown'
+
+    # Priority bonus: private bath is preferred, private kitchen is a bonus
+    # shared bath = deprioritize but don't exclude
+    priority_boost = 0
+    if private_bath:
+        priority_boost += 2
+    elif bath_status == 'unknown':
+        priority_boost += 0  # neutral — we don't know
+    else:
+        priority_boost -= 1  # shared bath, deprioritize
+
+    if private_kitchen:
+        priority_boost += 1
+
+    return {
+        'bathroom': bath_status,
+        'kitchen': kitchen_status,
+        'priority_boost': priority_boost,
+    }
 
 def check_date_availability(available_from, available_until):
     """
@@ -194,47 +261,52 @@ def is_within_target_area(neighborhood, price):
     
     return True
 
-def send_notification(apartment_data):
-    """Send push notification via ntfy.sh"""
+def send_batch_notification(apartments):
+    """Send one summary notification for all new apartments found this run."""
     from urllib.request import urlopen, Request as URequest
 
+    if not apartments:
+        return
+
+    count = len(apartments)
+    title = f"{count} new Amsterdam apt{'s' if count > 1 else ''} found"
+
+    lines = [f"{count} new listing{'s' if count > 1 else ''} this run:\n"]
+    for i, apt in enumerate(apartments, 1):
+        dist = apt.get('estimated_distance')
+        dist_str = f"~{dist:.1f} km" if dist is not None else "dist unknown"
+        bath = apt.get('bathroom', 'unknown')
+        kitchen = apt.get('kitchen', 'unknown')
+        url = apt.get('url', '')
+
+        lines.append(f"{i}. {apt['title']} - {apt['neighborhood']}")
+        lines.append(f"   EUR{apt['price']}/month | {apt.get('date_range', 'Check listing')}")
+        lines.append(f"   {dist_str} | Bathroom: {bath} | Kitchen: {kitchen}")
+        lines.append(f"   Student-friendly: {apt['student_status']} | Priority: {apt['priority']}")
+        if url:
+            lines.append(f"   {url}")
+        lines.append("")
+
+    message = "\n".join(lines).strip()
+
+    has_high = any(a.get('priority') == 'high' for a in apartments)
+
     try:
-        title = f"New apt: {apartment_data['title']}"
-
-        dist = apartment_data.get('estimated_distance')
-        dist_str = f"~{dist:.1f} km from Roeterseiland" if dist is not None else "distance unknown"
-
-        message = (
-            f"Price: EUR{apartment_data['price']}/month\n"
-            f"Available: {apartment_data.get('date_range', 'Check listing')}\n"
-            f"Neighborhood: {apartment_data['neighborhood']}\n"
-            f"Distance: {dist_str}\n"
-            f"Student-friendly: {apartment_data['student_status']}\n"
-            f"Priority: {apartment_data['priority']}"
-        )
-
-        listing_url = apartment_data.get('url', '')
-
-        headers = {
-            "Title": title,
-            "Priority": "high" if apartment_data.get('priority') == 'high' else "default",
-            "Tags": "house",
-        }
-        if listing_url:
-            headers["Click"] = listing_url  # tapping the notification opens the listing
-
         req = URequest(
             f"https://ntfy.sh/{NOTIFICATION_URL}",
             data=message.encode(),
-            headers=headers,
+            headers={
+                "Title": title,
+                "Priority": "high" if has_high else "default",
+                "Tags": "house",
+            },
             method="POST",
         )
         with urlopen(req) as r:
             if r.status == 200:
-                print(f"✅ Notification sent: {apartment_data['title']}")
+                print(f"✅ Batch notification sent: {count} apartment(s)")
             else:
                 print(f"⚠️  Unexpected ntfy status {r.status}")
-
     except Exception as e:
         print(f"❌ Failed to send notification: {e}")
 
@@ -256,6 +328,20 @@ def process_apartment(item, source):
         student_info = check_student_friendly(item.get('description', ''), item['title'])
         apartment['student_status'] = student_info['is_student']
         apartment['priority'] = student_info['priority']
+
+        # Check bathroom and kitchen amenities
+        amenity_info = check_amenities(item.get('description', ''), item['title'])
+        apartment['bathroom'] = amenity_info['bathroom']
+        apartment['kitchen'] = amenity_info['kitchen']
+
+        # Adjust priority based on amenities
+        # private bath = preferred, shared bath = deprioritized (but not excluded)
+        # private kitchen = bonus
+        boost = amenity_info['priority_boost']
+        priority_order = ['low', 'medium', 'high']
+        current_idx = priority_order.index(apartment['priority'])
+        new_idx = max(0, min(2, current_idx + (1 if boost > 0 else (-1 if boost < 0 else 0))))
+        apartment['priority'] = priority_order[new_idx]
         
         # Validate criteria
         if apartment['price'] < BUDGET_MIN or apartment['price'] > BUDGET_MAX:
@@ -321,21 +407,19 @@ def main():
         # Mark as seen
         seen[apartment['id']] = apartment
         new_apartments.append(apartment)
-        
-        # Send notification
-        send_notification(apartment)
-        
-        # Rate limit notifications (5 second delay between each)
-        time.sleep(5)
-    
+
     # Save state
     save_seen_apartments(seen)
-    
+
+    # Send one batch notification for everything found this run
+    if new_apartments:
+        send_batch_notification(new_apartments)
+
     # Summary
     print(f"\n📊 Summary:")
     print(f"New apartments found: {len(new_apartments)}")
     print(f"Total apartments seen so far: {len(seen)}")
-    
+
     if new_apartments:
         print(f"\n🎯 New apartments:")
         for apt in new_apartments:
