@@ -19,7 +19,7 @@ from urllib.parse import urlencode
 BUDGET_MIN = 0
 BUDGET_MAX = 1750
 MAX_DISTANCE_KM = 5
-NOTIFICATION_URL = os.environ.get('NTFY_TOPIC', 'amsterdam-apts-josephm')
+NOTIFICATION_URL = os.environ.get('NTFY_TOPIC') or 'amsterdam-apts-josephm'
 DB_FILE = 'seen_apartments.json'
 
 MOVE_IN_START  = "2026-08-15"
@@ -154,45 +154,111 @@ def scrape_pararius():
 
 
 def scrape_kamernet():
-    """Kamernet JSON search API."""
+    """Kamernet — try their search page HTML."""
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError:
+        return []
+
     apartments = []
     try:
-        # Try their public search API
-        url = (
-            "https://kamernet.nl/api/v1/search/listings"
-            "?locationids=1&radius=10&maxrent=1750&listingtype=7&pageno=1&pagesize=40&sortby=date_desc"
-        )
-        data = fetch_json(url, {'Referer': 'https://kamernet.nl/en/for-rent/apartments-amsterdam'})
-        listings = data.get('listings') or data.get('data') or []
-        print(f"[Kamernet] API returned {len(listings)} raw listings")
+        url = "https://kamernet.nl/en/for-rent/apartments-amsterdam?maxRent=1750&radius=10"
+        html = fetch_html(url, {'Referer': 'https://kamernet.nl/'})
+        soup = BeautifulSoup(html, 'html.parser')
 
-        for item in listings:
+        cards = soup.select('[class*="listing"], [class*="tile"], [class*="property"], article')
+        print(f"[Kamernet] Found {len(cards)} raw cards")
+
+        for card in cards:
             try:
-                price = int(item.get('rent', 0) or item.get('price', 0))
-                if not price or price > BUDGET_MAX:
+                link = card.find('a', href=re.compile(r'/en/for-rent/'))
+                if not link:
                     continue
-                title = item.get('title') or item.get('listingTitle') or 'Kamernet listing'
-                district = item.get('cityDistrictName') or item.get('neighborhood') or 'Amsterdam'
-                neighborhood = district.split(',')[0].strip()
-                lid = item.get('listingId') or item.get('id') or ''
-                url_val = f"https://kamernet.nl/en/for-rent/room-amsterdam/{lid}" if lid else 'https://kamernet.nl'
-                apt = {
-                    'title': title, 'price': price,
-                    'neighborhood': neighborhood,
-                    'url': url_val,
-                    'description': item.get('description') or '',
-                }
-                if item.get('availableFrom'):
-                    apt['available_from'] = str(item['availableFrom'])[:10]
-                if item.get('availableUntil'):
-                    apt['available_until'] = str(item['availableUntil'])[:10]
-                apartments.append(apt)
+                href = link.get('href', '')
+                if href.startswith('/'):
+                    href = 'https://kamernet.nl' + href
+                title_el = card.find(['h2', 'h3', 'h4'])
+                title = title_el.get_text(strip=True) if title_el else ''
+                price_match = re.search(r'€\s*([\d,.]+)', card.get_text())
+                price = parse_price(price_match.group(1)) if price_match else 0
+                loc_el = card.find(string=re.compile(r'Amsterdam'))
+                neighborhood = loc_el.strip().split(',')[0] if loc_el else 'Amsterdam'
+                if title and 0 < price <= BUDGET_MAX:
+                    apartments.append({
+                        'title': title, 'price': price,
+                        'neighborhood': neighborhood,
+                        'url': href, 'description': card.get_text(' ', strip=True)[:300],
+                    })
             except Exception:
                 continue
     except Exception as e:
         print(f"[Kamernet] Error: {e}")
 
     print(f"[Kamernet] Found {len(apartments)} listings")
+    return apartments
+
+
+def scrape_funda():
+    """Funda.nl — largest Dutch real estate site, heavy SEO = server-side HTML."""
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError:
+        return []
+
+    apartments = []
+    try:
+        url = "https://www.funda.nl/en/zoeken/huur/?selected_area=%5B%22amsterdam%22%5D&price=%22-1750%22&object_type=%5B%22apartment%22%5D"
+        html = fetch_html(url)
+        soup = BeautifulSoup(html, 'html.parser')
+
+        # Funda embeds search results as JSON in a script tag
+        for script in soup.find_all('script'):
+            text = script.string or ''
+            if 'searchresult' in text.lower() or 'listings' in text.lower():
+                try:
+                    # Find JSON blob
+                    match = re.search(r'\{.*"price".*\}', text, re.DOTALL)
+                    if match:
+                        data = json.loads(match.group())
+                        # parse if found
+                        break
+                except Exception:
+                    pass
+
+        # Card-based HTML parsing
+        cards = soup.select('[data-test-id="search-result-item"], [class*="search-result"], [class*="listing-result"]')
+        print(f"[Funda] Found {len(cards)} raw cards")
+
+        for card in cards:
+            try:
+                link = card.find('a', href=re.compile(r'/huur/|/en/rent/'))
+                if not link:
+                    continue
+                href = link.get('href', '')
+                if href.startswith('/'):
+                    href = 'https://www.funda.nl' + href
+                title_el = card.find(['h2', 'h3', 'h4', '[class*="title"]'])
+                title = title_el.get_text(strip=True) if title_el else ''
+                price_match = re.search(r'€\s*([\d,.]+)', card.get_text())
+                price = parse_price(price_match.group(1)) if price_match else 0
+                loc_text = card.get_text()
+                neighborhood = 'Amsterdam'
+                for n in TARGET_NEIGHBORHOODS:
+                    if n.lower() in loc_text.lower():
+                        neighborhood = n
+                        break
+                if title and 0 < price <= BUDGET_MAX:
+                    apartments.append({
+                        'title': title, 'price': price,
+                        'neighborhood': neighborhood,
+                        'url': href, 'description': card.get_text(' ', strip=True)[:300],
+                    })
+            except Exception:
+                continue
+    except Exception as e:
+        print(f"[Funda] Error: {e}")
+
+    print(f"[Funda] Found {len(apartments)} listings")
     return apartments
 
 
@@ -456,7 +522,7 @@ def send_batch_notification(apartments):
 
 def send_heartbeat(new_count, total_seen, sources_summary):
     """Status notification every run — confirms the bot is alive."""
-    title = f"Bot ran — {new_count} new apt{'s' if new_count != 1 else ''} found"
+    title = f"Bot ran: {new_count} new apt{'s' if new_count != 1 else ''} found"
     message = (
         f"Run at {datetime.now().strftime('%Y-%m-%d %H:%M')} UTC\n"
         f"New listings this run: {new_count}\n"
@@ -468,10 +534,12 @@ def send_heartbeat(new_count, total_seen, sources_summary):
 
 def _ntfy_send(title, message, priority="default"):
     try:
+        # HTTP headers must be ASCII-safe — strip/replace any non-ASCII characters
+        safe_title = title.encode('ascii', 'replace').decode('ascii')
         req = Request(
             f"https://ntfy.sh/{NOTIFICATION_URL}",
-            data=message.encode(),
-            headers={"Title": title, "Priority": priority, "Tags": "house"},
+            data=message.encode('utf-8'),
+            headers={"Title": safe_title, "Priority": priority, "Tags": "house"},
             method="POST",
         )
         with urlopen(req, timeout=15) as r:
@@ -544,9 +612,8 @@ def main():
     sources = [
         (scrape_pararius,       'Pararius'),
         (scrape_kamernet,       'Kamernet'),
+        (scrape_funda,          'Funda'),
         (scrape_housinganywhere,'HousingAnywhere'),
-        (scrape_duwo,           'DUWO'),
-        (scrape_room_nl,        'ROOM.nl'),
     ]
 
     all_raw = []
