@@ -1,33 +1,30 @@
 name: Amsterdam Apartment Hunter
 
+# GitHub Actions cron is always evaluated in UTC. Eastern Time shifts between
+# UTC-4 (EDT, ~mid-Mar -> early Nov) and UTC-5 (EST, early Nov -> mid-Mar), so
+# we use two cron entries — one per offset — and gate them by month so each
+# fires only during the part of the year it's correct.
+#
+# Both entries fire at: 8:00, 12:00, 16:00, 20:00, and 24:00 (= 00:00 next day) ET.
 on:
   schedule:
-    - cron: '0 0,4,12,16,20 * * *'
+    # EDT (UTC-4), active Mar-Oct: 12:00, 16:00, 20:00 UTC same day +
+    #                              00:00, 04:00 UTC next day
+    - cron: '0 0,4,12,16,20 * 3-10 *'
+    # EST (UTC-5), active Nov-Feb: 13:00, 17:00, 21:00 UTC same day +
+    #                              01:00, 05:00 UTC next day
+    - cron: '0 1,5,13,17,21 * 1,2,11,12 *'
   workflow_dispatch:
 
 jobs:
   hunt-apartments:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
-
-    - uses: actions/setup-python@v5
-      with:
-        python-version: '3.11'
-
-    - name: Install dependencies
-      run: pip install -r requirements.txt
-
-    - name: Run apartment hunter
-      run: python apartment_hunter.py
-      env:
-        NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
-
-    - name: Save seen apartments (persist between runs)
-      run: |
-        git config user.name "github-actions[bot]"
-        git config user.email "github-actions[bot]@users.noreply.github.com"
-        git add seen_apartments.json || true
-        git diff --staged --quiet || git commit -m "Update seen apartments [skip ci]" && git push || true
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install -r requirements.txt
+      - run: python apartment_hunter.py
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}

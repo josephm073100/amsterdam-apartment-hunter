@@ -1,3 +1,35 @@
+# Python
 __pycache__/
 *.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Local state
 seen_apartments.json
+*.log
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+
+# ───────────────────────────────────────────────────────────────────────────
+# Local helper scripts that contain a hardcoded GitHub PAT.
+# Never commit these to a public repo.
+# ───────────────────────────────────────────────────────────────────────────
+push_fixes.py
+setup_github.py
+github_setup.py
+check_runs.py
+check_logs.py
+trigger_run.py
+run_fix.command
+FINAL_INSTRUCTIONS.txt
+QUICK_SETUP_COMMANDS.txt
+
+# Catch-all for any future scratch script that ends up holding credentials
+*_secrets.py
+*.secrets
+.env
+.env.*

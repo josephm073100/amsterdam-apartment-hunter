@@ -71,9 +71,43 @@ def fetch_json(url, extra_headers=None):
         return json.loads(raw)
 
 def parse_price(text):
-    text = str(text).replace(',', '').replace('.', '').replace(' ', '')
-    nums = re.findall(r'\d{3,}', text)
-    return int(nums[0]) if nums else 0
+    """Parse a euro price from raw text.
+
+    Handles US (1,750.50 / 1,750), Dutch (1.750,50 / 1.750),
+    space-separated (1 750), and decimal-only (1750) formats.
+    Returns the integer euro amount; cents are dropped.
+    """
+    s = str(text)
+    # Strip currency symbols and per-month markers so the number stands alone.
+    s = re.sub(r'(?i)€|EUR|/\s*(month|maand|mo)|p\.?m\.?', ' ', s)
+    # Pull the first number-like token, including separators.
+    m = re.search(r'\d[\d\s.,]*\d|\d', s)
+    if not m:
+        return 0
+    token = m.group(0).strip()
+    # Spaces are thousand separators in NL/FR — drop them outright.
+    token = token.replace(' ', '')
+
+    if ',' in token and '.' in token:
+        # Both present: the rightmost separator is the decimal mark.
+        if token.rfind(',') > token.rfind('.'):
+            token = token.replace('.', '').replace(',', '.')   # 1.750,50 -> 1750.50
+        else:
+            token = token.replace(',', '')                       # 1,750.50 -> 1750.50
+    elif ',' in token:
+        # Comma alone: decimal if 1-2 digits follow, else thousands sep.
+        tail = token.split(',')[-1]
+        token = token.replace(',', '.') if 1 <= len(tail) <= 2 else token.replace(',', '')
+    elif '.' in token:
+        # Period alone: thousands sep if exactly 3 digits follow (Dutch 1.750), else decimal.
+        tail = token.split('.')[-1]
+        if len(tail) == 3 and token.count('.') == 1:
+            token = token.replace('.', '')
+
+    try:
+        return int(float(token))
+    except ValueError:
+        return 0
 
 def load_seen_apartments():
     if os.path.exists(DB_FILE):
@@ -237,9 +271,12 @@ def scrape_funda():
                 href = link.get('href', '')
                 if href.startswith('/'):
                     href = 'https://www.funda.nl' + href
-                title_el = card.find(['h2', 'h3', 'h4', '[class*="title"]'])
+                title_el = (
+                    card.find(['h2', 'h3', 'h4'])
+                    or card.select_one('[class*="title"], [class*="Title"]')
+                )
                 title = title_el.get_text(strip=True) if title_el else ''
-                price_match = re.search(r'€\s*([\d,.]+)', card.get_text())
+                price_match = re.search(r'€\s*([\d.,\s]+)', card.get_text())
                 price = parse_price(price_match.group(1)) if price_match else 0
                 loc_text = card.get_text()
                 neighborhood = 'Amsterdam'
